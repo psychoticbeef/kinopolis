@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+TMP=$(mktemp -d)
+trap 'rm -rf -- "$TMP"' EXIT
+mkdir "$TMP/bin"
+cat > "$TMP/bin/curl" <<'SH'
+#!/usr/bin/env bash
+set -eu
+[[ ${TEST_FETCH_FAIL:-0} == 0 ]] || exit 22
+while [[ $# -gt 0 ]]; do
+    if [[ $1 == -o ]]; then cp "$TEST_HTML" "$2"; exit; fi
+    shift
+done
+exit 1
+SH
+# On a non-Linux development host, test state handling with a lock stub.
+# On Linux, the suite uses the real flock and checks overlapping runs too.
+if ! command -v flock >/dev/null; then
+    echo 'Hinweis: flock fehlt; Parallelitätstest wird übersprungen.' >&2
+    printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/flock"
+    NO_FLOCK=1
+fi
+cat > "$TMP/hook" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$KINO_EVENT_ID" >> "$TEST_ATTEMPTS"
+cat > "$TEST_MESSAGE"
+[[ ${TEST_HOOK_FAIL:-0} == 0 ]] || exit 1
+echo sent >> "$TEST_DELIVERIES"
+SH
+chmod +x "$TMP/bin/"* "$TMP/hook"
+export PATH="$TMP/bin:$PATH" KINO_CONFIG="$TMP/config" KINO_STATE_DIR="$TMP/state" KINO_NOTIFY="$TMP/hook"
+export TEST_ATTEMPTS="$TMP/attempts" TEST_MESSAGE="$TMP/message" TEST_DELIVERIES="$TMP/deliveries"
+export TEST_HTML="$ROOT/tests/fixtures/empty.html"
+touch "$TEST_ATTEMPTS" "$TEST_DELIVERIES"
+URL=https://www.kinopolis.de/ko/filmdetail/test/ABC
+run() {
+    if bash "$ROOT/kino-watch" "$@" > "$TMP/out" 2> "$TMP/err"; then return 0; fi
+    cat "$TMP/err" >&2
+    return 1
+}
+assert_count() { [[ $(wc -l < "$TEST_DELIVERIES") -eq $1 ]]; }
+assert_flag() { [[ $(head -n 1 "$KINO_STATE_DIR/test.state") == "$1" ]]; }
+printf 'test|available|%s\n' "$URL" > "$KINO_CONFIG"
+run check; assert_count 0; assert_flag armed
+export TEST_HTML="$ROOT/tests/fixtures/one.html"
+run check; assert_count 1; assert_flag paused
+[[ $(tail -n +3 "$KINO_STATE_DIR/test.state") == OV001 ]]
+run check; assert_count 1
+run rearm test; run check; assert_count 1; assert_flag armed
+export TEST_HTML="$ROOT/tests/fixtures/two.html"
+run check; assert_count 2; assert_flag paused
+[[ $(cat "$TEST_MESSAGE") == *vorstellung/OV002* ]]
+[[ $(cat "$TEST_MESSAGE") != *vorstellung/OV001* ]]
+
+# New mode initializes silently; disappearing and returning IDs stay known.
+rm -rf "$KINO_STATE_DIR"
+printf 'test|new|%s\n' "$URL" > "$KINO_CONFIG"
+export TEST_HTML="$ROOT/tests/fixtures/one.html"
+run check; assert_count 2; assert_flag armed
+export TEST_HTML="$ROOT/tests/fixtures/empty.html"
+run check
+export TEST_HTML="$ROOT/tests/fixtures/one.html"
+run check; assert_count 2
+
+# Fetch/parser failures preserve the complete state.
+cp "$KINO_STATE_DIR/test.state" "$TMP/before"
+export TEST_FETCH_FAIL=1
+if run check; then exit 1; fi
+cmp "$TMP/before" "$KINO_STATE_DIR/test.state"
+unset TEST_FETCH_FAIL
+echo '<h1>Error</h1>' > "$TMP/bad.html"
+export TEST_HTML="$TMP/bad.html"
+if run check; then exit 1; fi
+cmp "$TMP/before" "$KINO_STATE_DIR/test.state"
+
+# A failed hook leaves a durable event; retry uses the same event and payload,
+# even if the live page has changed. Success pauses, subsequent checks stay quiet.
+export TEST_HTML="$ROOT/tests/fixtures/two.html" TEST_HOOK_FAIL=1
+if run check; then exit 1; fi
+assert_flag armed
+cp "$TEST_MESSAGE" "$TMP/pending-message"
+first_event=$(tail -n 1 "$TEST_ATTEMPTS")
+run rearm test
+unset TEST_HOOK_FAIL
+export TEST_HTML="$ROOT/tests/fixtures/empty.html"
+run check; assert_count 3; assert_flag paused
+[[ $(tail -n 1 "$TEST_ATTEMPTS") == "$first_event" ]]
+cmp "$TEST_MESSAGE" "$TMP/pending-message"
+run check; assert_count 3
+
+# Baseline explicitly accepts current slots, pause prevents fetching/delivery.
+export TEST_HTML="$ROOT/tests/fixtures/two.html"
+run baseline test; assert_flag armed
+run check; assert_count 3
+run pause test
+export TEST_FETCH_FAIL=1
+run check; assert_count 3
+unset TEST_FETCH_FAIL
+if [[ ${NO_FLOCK:-0} == 0 ]]; then
+    exec 8>"$KINO_STATE_DIR/.lock"
+    flock 8
+    run rearm test
+    assert_flag paused
+    flock -u 8
+fi
+echo 'OK: OV-Parser, Baseline, Deduplizierung, Pause/Rearm, Fehler und Zustellwiederholung'

@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+CONFIG=${KINO_CONFIG:-$ROOT/watches.tsv}
+STATE=${KINO_STATE_DIR:-$ROOT/state}
+HOOK=${KINO_NOTIFY:-$ROOT/hooks/stdout}
+die() { printf '%s\n' "$*" >&2; exit 1; }
+log() { printf '%s\n' "$*" >&2; }
+usage() {
+    echo 'kino-watch check | status | rearm ID | pause ID | baseline ID'
+}
+command=${1:-check}
+case $command in check|status) [[ $# -le 1 ]] || die 'Zu viele Argumente';;
+    rearm|pause|baseline) [[ $# == 2 ]] || die 'Film-ID fehlt';;
+    *) usage; exit 1;; esac
+for dep in curl awk sort comm flock mktemp sed tail wc tr; do
+    command -v "$dep" >/dev/null || die "Fehlt: $dep"
+done
+[[ -r $CONFIG ]] || die "Konfiguration fehlt: $CONFIG"
+mkdir -p -- "$STATE"
+chmod 700 "$STATE"
+exec 9>"$STATE/.lock"
+flock -n 9 || { log 'Anderer Lauf ist aktiv; übersprungen.'; exit 0; }
+WORK=$(mktemp -d "$STATE/.work.XXXXXX")
+trap 'rm -rf -- "$WORK"' EXIT
+
+# Validate all rows before any delivery or mutation. This file is data, no shell code.
+awk -F '|' '
+    /^[[:space:]]*(#|$)/ { next }
+    NF != 3 || $1 !~ /^[a-z0-9][a-z0-9_-]*$/ ||
+    ($2 != "available" && $2 != "new") ||
+    $3 !~ /^https:\/\/www\.kinopolis\.de\/[a-z]+\/filmdetail\/[a-zA-Z0-9_-]+\/[a-zA-Z0-9]+(#tickets)?$/ || seen[$1]++ {
+        print "Ungültige/duplicate Konfiguration, Zeile " NR > "/dev/stderr"; bad = 1
+    }
+    END { exit bad }
+' "$CONFIG" || die 'Konfiguration korrigieren'
+awk '!/^[[:space:]]*(#|$)/' "$CONFIG" > "$WORK/config"
+
+fetch() {
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --connect-timeout 10 --max-time 45 --retry 2 --retry-delay 2 \
+        --user-agent 'kino-watch/1.0 (hourly personal ticket monitor)' \
+        "$url" -o "$WORK/page" || return 1
+    awk -f "$ROOT/parse-kinopolis.awk" "$WORK/page" > "$WORK/raw" || return 1
+    sort -u "$WORK/raw" > "$WORK/current"
+}
+save() {
+    { printf '%s\n%s\n' "$1" "$url"; cat "$2"; } > "$WORK/state"
+    mv -f -- "$WORK/state" "$file"
+}
+deliver() {
+    local event
+    IFS= read -r event < "$pending/event"
+    if [[ ! -x $HOOK ]]; then log "$id: Hook nicht ausführbar: $HOOK"; return 1; fi
+    if KINO_WATCH_ID="$id" KINO_EVENT_ID="$event" KINO_FILM_URL="$url" \
+        "$HOOK" < "$pending/message"; then
+        # Commit pause + seen IDs together. A leftover pending directory after
+        # this rename is ignored on the next run because the watch is paused.
+        mv -f -- "$pending/state" "$file"
+        rm -rf -- "$pending"
+        log "$id: gemeldet und pausiert"
+    else
+        log "$id: Meldung fehlgeschlagen; identisches Ereignis wird erneut versucht"
+        return 1
+    fi
+}
+found=0
+failed=0
+while IFS='|' read -r id mode url; do
+    if [[ $command != check && $command != status && $id != "$2" ]]; then continue; fi
+    found=1
+    url=${url%#tickets}
+    file="$STATE/$id.state"
+    pending="$STATE/$id.pending"
+    flag=uninitialized
+    : > "$WORK/seen"
+    if [[ -f $file ]]; then
+        IFS= read -r flag < "$file"
+        stored_url=$(sed -n '2p' "$file")
+        [[ $stored_url == "$url" ]] || die "$id: URL geändert; neue Film-ID verwenden"
+        [[ $flag == armed || $flag == paused ]] || die "$id: ungültiger Zustand"
+        tail -n +3 "$file" > "$WORK/seen"
+    fi
+    case $command in
+        status)
+            printf '%s: %s (%s, %s bekannte OV-Vorstellungen)%s\n' "$id" "$flag" "$mode" \
+                "$(wc -l < "$WORK/seen" | tr -d ' ')" "$( [[ -d $pending && $flag != paused ]] && echo ' — Meldung ausstehend' || true )"
+            continue;;
+        pause)
+            save paused "$WORK/seen"
+            rm -rf -- "$pending"
+            log "$id: pausiert"; continue;;
+        rearm)
+            [[ $flag != uninitialized ]] || die "$id: zuerst check oder baseline ausführen"
+            save armed "$WORK/seen"
+            # A pending event on an already armed watch must survive rearm.
+            [[ $flag != paused ]] || rm -rf -- "$pending"
+            log "$id: wieder aktiv; bekannte Vorstellungen bleiben gespeichert"; continue;;
+    esac
+    if [[ $command == check && $flag == paused ]]; then continue; fi
+    if [[ $command == check && -d $pending ]]; then
+        if ! deliver; then failed=1; fi
+        continue
+    fi
+    if ! fetch; then log "$id: Abruf/Parsing fehlgeschlagen; Zustand unverändert"; failed=1; continue; fi
+    if [[ $command == baseline || ( $flag == uninitialized && $mode == new ) ]]; then
+        sort -u "$WORK/seen" "$WORK/current" > "$WORK/union"
+        save armed "$WORK/union"
+        rm -rf -- "$pending"
+        log "$id: Ausgangsstand gespeichert; aktiv"
+        continue
+    fi
+    comm -13 "$WORK/seen" "$WORK/current" > "$WORK/new"
+    sort -u "$WORK/seen" "$WORK/current" > "$WORK/union"
+    if [[ ! -s $WORK/new ]]; then
+        save armed "$WORK/union"
+        log "$id: keine neuen kaufbaren OV-Vorstellungen"
+        continue
+    fi
+    mkdir "$WORK/pending"
+    { printf 'paused\n%s\n' "$url"; cat "$WORK/union"; } > "$WORK/pending/state"
+    {
+        printf '%s:' "$id"
+        while IFS= read -r performance; do printf '%s,' "$performance"; done < "$WORK/new"
+        printf '\n'
+    } > "$WORK/pending/event"
+    cinema=${url#https://www.kinopolis.de/}; cinema=${cinema%%/*}
+    {
+        printf 'Neue kaufbare OV-Vorstellungen: %s\n\nFilm: %s#tickets\n\n' "$id" "$url"
+        while IFS= read -r performance; do
+            printf 'https://www.kinopolis.de/%s/programm/vorstellung/%s\n' "$cinema" "$performance"
+        done < "$WORK/new"
+    } > "$WORK/pending/message"
+    mv -- "$WORK/pending" "$pending"
+    if ! deliver; then failed=1; fi
+done < "$WORK/config"
+[[ $found == 1 ]] || die "Film-ID nicht gefunden: ${2:-}"
+exit "$failed"

@@ -1,0 +1,24 @@
+# Local runtime state and logs
+/state/
+*.log
+
+# Credentials (keep examples trackable)
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+
+# Nix build outputs
+/result
+/result-*
+.direnv/
+
+# Editor and OS files
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Local distribution archive
+kinoticket-tool.tar.gz
